@@ -421,7 +421,7 @@ async def process_whiteboard_image(
 
 # =============== New RAG System Endpoints ===============
 
-@app.get("/rag/documents", responseModel=List[DocumentInfo])
+@app.get("/rag/documents", response_model=List[DocumentInfo])
 async def get_documents():
     try:
         rag_system = get_rag_system()
@@ -430,7 +430,7 @@ async def get_documents():
         print(f"Error getting document list: {e}")
         return {"error": str(e)}
 
-@app.post("/rag/scan", responseModel=ScanResponse)
+@app.post("/rag/scan", response_model=ScanResponse)
 async def scan_documents():
     try:
         rag_system = get_rag_system()
@@ -505,7 +505,7 @@ if __name__ == "__main__":
                 print(f"Warning: Could not remove temp file at startup: {e}")
     
     # Configure OpenRouter API key
-    os.environ["OPENROUTER_API_KEY"] = "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"
+    os.environ["OPENROUTER_API_KEY"] = "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"
     print("OpenRouter API key configured")
     
     # Scan RAG_docs folder on startup

@@ -205,7 +205,7 @@ def get_answer_from_text(text):
             user_content = f"{enhanced_prompt['context']}\n\nBased on the above information (if relevant), please answer the following question:\n{enhanced_prompt['query']}"
         
         # Make the API call to OpenRouter
-        api_key = os.environ.get("OPENROUTER_API_KEY", "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")
+        api_key = os.environ.get("OPENROUTER_API_KEY", "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")
         
         print(f"Making OpenRouter API call for: {user_content[:100]}...")
         
@@ -358,7 +358,7 @@ def get_answer_from_image_and_prompt(image_data: bytes, prompt: str) -> str:
         encoded_image = base64.b64encode(latest_image).decode('utf-8')
 
         # Prepare the API call to OpenRouter
-        api_key = os.environ.get("OPENROUTER_API_KEY", "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")
+        api_key = os.environ.get("OPENROUTER_API_KEY", "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")
         
         system_message = """
         You are a helpful assistant that can understand images and text prompts.
@@ -412,9 +412,7 @@ def get_answer_from_image_and_prompt(image_data: bytes, prompt: str) -> str:
         return f"Error processing image and prompt: {str(e)}"
 
 def main():
-    # Configure OpenRouter API key
-    os.environ["OPENROUTER_API_KEY"] = "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"
-    print("Configuring OpenRouter client...")
+
     global llm
     llm = setup_openrouter_client()
     
