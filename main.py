@@ -1,552 +1,407 @@
-from fastapi import FastAPI, UploadFile, File, Form, Body, Request
+"""
+PEARL AI Backend - Main Entry Point
+Orchestrates all backend components for the AI tutor system
+"""
+
+from fastapi import FastAPI, UploadFile, File, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
 import os
-import shutil
-from typing import Optional, Dict, Any, List
+import uvicorn
+import asyncio
+from typing import Dict, Any, Optional
 from pydantic import BaseModel
-import json
+
+# Load environment variables
+load_dotenv()
 
 # Import backend modules
-from backend.query_model import get_answer_from_text
-from backend.speech import transcribe_audio, generate_tts_audio, TEMP_AUDIO_PATH, TTS_OUTPUT_DIR
-from backend.rag_system import get_rag_system, Document, RAG_DOCS_DIR
+from backend.core_agent import CoreAgent
+from backend.speech_processor import SpeechProcessor, TTS_OUTPUT_DIR
+from backend.camera_system import CameraSystem
+from backend.emotion_analyzer import EmotionAnalyzer
+from backend.rag_system import RAGSystem, RAG_DOCS_DIR
+from backend.learning_tracker import LearningTracker
+from backend.intent_classifier import IntentClassifier
+from backend.commands.command_executor import CommandExecutor
 
-app = FastAPI()
+# Request models
+class TextRequest(BaseModel):
+    text: str
 
-# Configure CORS middleware
+class TTSRequest(BaseModel):
+    text: str
+
+# Initialize FastAPI app
+app = FastAPI(title="PEARL AI Backend", version="2.0.0")
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure directories for static files
+# Create required directories
 os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
+os.makedirs(RAG_DOCS_DIR, exist_ok=True)
+os.makedirs("camera_captures", exist_ok=True)
+os.makedirs("learning_data", exist_ok=True)
+
+# Mount static files
 app.mount("/tts_output", StaticFiles(directory=TTS_OUTPUT_DIR), name="tts_output")
 
-WHITEBOARD_DIR = "whiteboard_images"
-os.makedirs(WHITEBOARD_DIR, exist_ok=True)
+# Global components - initialized on startup
+core_agent: Optional[CoreAgent] = None
+speech_processor: Optional[SpeechProcessor] = None
+camera_system: Optional[CameraSystem] = None
+emotion_analyzer: Optional[EmotionAnalyzer] = None
+rag_system: Optional[RAGSystem] = None
+learning_tracker: Optional[LearningTracker] = None
+intent_classifier: Optional[IntentClassifier] = None
+command_executor: Optional[CommandExecutor] = None
 
-os.makedirs(RAG_DOCS_DIR, exist_ok=True)
-
-# Define request/response models
-class TTSRequest(BaseModel):
-    text: str
-
-class TranscriptUpdateRequest(BaseModel):
-    transcript: str
+@app.on_event("startup")
+async def startup_event():
+    """Initialize all backend components on startup"""
+    global core_agent, speech_processor, camera_system, emotion_analyzer
+    global rag_system, learning_tracker, intent_classifier, command_executor
     
-class DocumentInfo(BaseModel):
-    id: str
-    title: str
-    original_file: str
-    in_folder: bool
-    in_faiss: bool
-    last_modified: float
-
-class ScanResponse(BaseModel):
-    added: int
-    updated: int
-    total_docs: int
-    total_in_faiss: int
+    print("Initializing PEARL AI Backend...")
     
-class RemoveDocumentRequest(BaseModel):
-    doc_id: str
-
-class TextOnlyRequest(BaseModel):
-    text: str
-
-# Initialize conversation history
-conversation_history = []
-
-
-
-@app.post("/tutor/speak")
-async def tutor_from_audio(file: UploadFile = File(...)):
-    """
-    Process audio from the user, transcribe it, generate a response, and return both text and audio.
-    """
+    # Initialize core components
     try:
-        print("Step 1: Received audio file:", file.filename)
-
-        # Always save to the same temp file path to avoid accumulation
-        with open(TEMP_AUDIO_PATH, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        print(f"Step 2: Saved uploaded audio to {TEMP_AUDIO_PATH}")
-
-        # Transcribe the audio to text
-        print("Step 3: Starting transcription...")
-        text = transcribe_audio(TEMP_AUDIO_PATH)
-        print("Step 4: Transcription result:", text)
+        # 1. Speech processor
+        print("Initializing speech processor...")
+        speech_processor = SpeechProcessor()
         
+        # 2. Emotion analyzer
+        print("Initializing emotion analyzer...")
         try:
-            # Get a response based on the transcript by passing to query model
-            print("Step 5: Sending transcription to OpenRouter API...")
-            response = get_answer_from_text(text)
-            print("Step 6: OpenRouter API response:", response)
-            
-            # Check if response is a string (error) or the new format
-            if isinstance(response, str):
-                # Handle legacy error response format
-                answer = response
-                audio_path = None
-            else:
-                # Handle new structured response format
-                answer = response
-                
-                # Check if we have an explanation field in the answer
-                if isinstance(answer, dict) and isinstance(answer.get('answer', {}), dict):
-                    explanation = answer['answer'].get('explanation', '')
-                    
-                    # Check if explanation is a JSON string
-                    try:
-                        explanation_json = json.loads(explanation)
-                        if isinstance(explanation_json, dict) and 'explanation' in explanation_json:
-                            # Use the 'explanation' field from the JSON for TTS
-                            tts_text = explanation_json['explanation']
-                        else:
-                            tts_text = explanation
-                    except json.JSONDecodeError:
-                        tts_text = explanation
-                    
-                    # Use the extracted text for TTS
-                    audio_file = generate_tts_audio(tts_text)
-                    
-                    # Update the audio path in the response
-                    answer['audio'] = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-                else:
-                    # Use the entire response for TTS (fallback for legacy format)
-                    tts_text = str(answer)
-                    audio_file = generate_tts_audio(tts_text)
-                    audio_path = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-                    
-                    # If response was not structured, wrap it
-                    if not isinstance(answer, dict):
-                        answer = {
-                            "question": text,
-                            "answer": {
-                                "explanation": answer,
-                                "scene": [],
-                                "final_answer": {
-                                    "correct_value": "",
-                                    "explanation": "",
-                                    "feedback_correct": "Good job!",
-                                    "feedback_incorrect": "Try again!"
-                                }
-                            },
-                            "audio": audio_path
-                        }
-            
-            # Update conversation history
-            conversation_history.append({"role": "user", "content": text})
-            
-            # Extract explanation from structured response if available
-            if isinstance(response, dict) and isinstance(response.get('answer', {}), dict):
-                explanation = response['answer'].get('explanation', '')
-                
-                # Check if there's a final_answer field to include in the conversation history
-                final_answer = response['answer'].get('final_answer', {})
-                if final_answer:
-                    explanation_with_answer = f"{explanation} [ANSWER_INFO: {json.dumps(final_answer)}]"
-                    conversation_history.append({"role": "assistant", "content": explanation_with_answer})
-                else:
-                    conversation_history.append({"role": "assistant", "content": explanation})
-            else:
-                conversation_history.append({"role": "assistant", "content": str(response)})
-            
-            return answer
+            emotion_analyzer = EmotionAnalyzer()
+            print("Emotion analyzer ready")
+        except Exception as e:
+            print(f"Warning: Emotion analyzer failed to initialize: {e}")
+            emotion_analyzer = None
         
-        except Exception as model_error:
-            print("OpenRouter API Error:", model_error)
-            error_response = {
-                "error": f"The OpenRouter API encountered an error: {str(model_error)}",
-                "question": text,
-                "answer": {
-                    "explanation": "I'm sorry, I had trouble processing your request. The OpenRouter API is currently experiencing issues. Please try again later.",
-                    "scene": [],
-                    "final_answer": {
-                        "correct_value": "",
-                        "explanation": "",
-                        "feedback_correct": "",
-                        "feedback_incorrect": ""
-                    }
-                }
-            }
-
-            print("Generating TTS for error message...")
-            audio_file = generate_tts_audio(error_response["answer"]["explanation"])
-            audio_path = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-            error_response["audio"] = audio_path
-            print("Error TTS audio at", audio_path)
-
-            return error_response
-            
-    except Exception as e:
-        print("Audio Processing Error:", e)
-        return {"error": str(e)}
-
-@app.post("/tts")
-async def text_to_speech(request: TTSRequest):
-    """
-    Generate speech from text.
-    """
-    try:
-        audio_file = generate_tts_audio(request.text)
-        return {
-            "message": "Speech generated successfully",
-            "audio": f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-
-# Modified tutor/text endpoint to ensure proper JSON handling
-@app.post("/tutor/text")
-async def tutor_from_text(request: TextOnlyRequest):
-    """
-    Process text input from the user, generate a response, and return both text and audio.
-    """
-    try:
-        print("Received text input:", request.text)
-        
+        # 3. Camera system (with emotion callback)
+        print("Initializing camera system...")
         try:
-            # Get a response based on the text by passing to query model
-            print("Sending text to OpenRouter API...")
-            response = get_answer_from_text(request.text)
-            print("OpenRouter API response:", response)
-            
-            # Check if response is a string (error) or the structured format
-            if isinstance(response, str):
-                # Handle legacy error response format
-                answer = response
-                audio_path = None
-            else:
-                # Handle structured response format
-                answer = response
-                
-                # Check if we have an explanation field in the answer
-                if isinstance(answer, dict) and isinstance(answer.get('answer', {}), dict):
-                    explanation = answer['answer'].get('explanation', '')
-                    
-                    # Process explanation - if it's JSON, extract the explanation text
-                    try:
-                        if explanation.startswith('{') and explanation.endswith('}'):
-                            explanation_json = json.loads(explanation)
-                            if isinstance(explanation_json, dict) and 'explanation' in explanation_json:
-                                # Use the 'explanation' field from the JSON for TTS
-                                tts_text = explanation_json['explanation']
-                            else:
-                                tts_text = explanation
-                        else:
-                            tts_text = explanation
-                    except (json.JSONDecodeError, AttributeError):
-                        tts_text = explanation
-                    
-                    # Use the extracted text for TTS
-                    audio_file = generate_tts_audio(tts_text)
-                    
-                    # Update the audio path in the response
-                    answer['audio'] = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-                else:
-                    # Use the entire response for TTS (fallback for legacy format)
-                    tts_text = str(answer)
-                    audio_file = generate_tts_audio(tts_text)
-                    audio_path = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-                    
-                    # If response was not structured, wrap it
-                    if not isinstance(answer, dict):
-                        answer = {
-                            "question": request.text,
-                            "answer": {
-                                "explanation": answer,
-                                "scene": [],
-                                "final_answer": {
-                                    "correct_value": "",
-                                    "explanation": "",
-                                    "feedback_correct": "Good job!",
-                                    "feedback_incorrect": "Try again!"
-                                }
-                            },
-                            "audio": audio_path
-                        }
-            
-            # Update conversation history - store only the clean explanation text
-            conversation_history.append({"role": "user", "content": request.text})
-            
-            # Extract explanation from structured response if available
-            if isinstance(response, dict) and isinstance(response.get('answer', {}), dict):
-                explanation = response['answer'].get('explanation', '')
-                
-                # Remove any JSON formatting if present
-                if isinstance(explanation, str) and explanation.startswith('{') and explanation.endswith('}'):
-                    try:
-                        explanation_json = json.loads(explanation)
-                        if isinstance(explanation_json, dict) and 'explanation' in explanation_json:
-                            explanation = explanation_json['explanation']
-                    except json.JSONDecodeError:
-                        pass
-                
-                # Check if there's a final_answer field to include in the conversation history
-                final_answer = response['answer'].get('final_answer', {})
-                if final_answer:
-                    explanation_with_answer = f"{explanation} [ANSWER_INFO: {json.dumps(final_answer)}]"
-                    conversation_history.append({"role": "assistant", "content": explanation_with_answer})
-                else:
-                    conversation_history.append({"role": "assistant", "content": explanation})
-            else:
-                conversation_history.append({"role": "assistant", "content": str(response)})
-            
-            # Make sure we're returning the fully structured response
-            if isinstance(answer, dict):
-                # Ensure the answer has the required structure
-                if 'answer' not in answer:
-                    answer = {
-                        "question": request.text,
-                        "answer": {
-                            "explanation": str(answer),
-                            "scene": [],
-                            "final_answer": {
-                                "correct_value": "",
-                                "explanation": "",
-                                "feedback_correct": "Good job!",
-                                "feedback_incorrect": "Try again!"
-                            }
-                        }
-                    }
-                elif isinstance(answer['answer'], dict) and 'final_answer' not in answer['answer']:
-                    # Add a default final_answer if missing
-                    answer['answer']['final_answer'] = {
-                        "correct_value": "",
-                        "explanation": "",
-                        "feedback_correct": "Good job!",
-                        "feedback_incorrect": "Try again!"
-                    }
-                
-                # Make sure there's an audio field
-                if 'audio' not in answer:
-                    # Generate TTS for the explanation
-                    explanation = ""
-                    if isinstance(answer['answer'], dict):
-                        explanation = answer['answer'].get('explanation', '')
-                    else:
-                        explanation = str(answer['answer'])
-                    
-                    audio_file = generate_tts_audio(explanation)
-                    answer['audio'] = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-            
-            print("Final structured response ready")
-            return answer
+            camera_system = CameraSystem(emotion_analyzer=emotion_analyzer)
+            print("Camera system ready")
+        except Exception as e:
+            print(f"Warning: Camera system failed to initialize: {e}")
+            camera_system = None
         
-        except Exception as model_error:
-            print("OpenRouter API Error:", model_error)
-            error_response = {
-                "error": f"The OpenRouter API encountered an error: {str(model_error)}",
-                "question": request.text,
-                "answer": {
-                    "explanation": "I'm sorry, I had trouble processing your request. The OpenRouter API is currently experiencing issues. Please try again later.",
-                    "scene": [],
-                    "final_answer": {
-                        "correct_value": "",
-                        "explanation": "",
-                        "feedback_correct": "",
-                        "feedback_incorrect": ""
-                    }
-                }
-            }
-
-            print("Generating TTS for error message...")
-            audio_file = generate_tts_audio(error_response["answer"]["explanation"])
-            audio_path = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-            error_response["audio"] = audio_path
-            print("Error TTS audio at", audio_path)
-
-            return error_response
-
+        # 4. RAG system
+        print("Initializing RAG system...")
+        rag_system = RAGSystem()
+        print("RAG system ready")
+        
+        # 5. Learning tracker
+        print("Initializing learning tracker...")
+        learning_tracker = LearningTracker()
+        print("Learning tracker ready")
+        
+        # 6. Intent classifier
+        print("Initializing intent classifier...")
+        intent_classifier = IntentClassifier()
+        print("Intent classifier ready")
+        
+        # 7. Command executor
+        print("Initializing command executor...")
+        command_executor = CommandExecutor(
+            camera_system=camera_system,
+            learning_tracker=learning_tracker
+        )
+        print("Command executor ready")
+        
+        # 8. Core agent (main orchestrator)
+        print("Initializing core agent...")
+        core_agent = CoreAgent(
+            speech_processor=speech_processor,
+            emotion_analyzer=emotion_analyzer,
+            camera_system=camera_system,
+            rag_system=rag_system,
+            learning_tracker=learning_tracker,
+            intent_classifier=intent_classifier,
+            command_executor=command_executor
+        )
+        print("Core agent ready")
+        
+        print("PEARL AI Backend initialization complete!")
+        
     except Exception as e:
-        print("Text Processing Error:", e)
-        return {"error": str(e)}
+        print(f"Critical error during initialization: {e}")
+        raise
 
-    
-    
-    
-@app.post("/update_transcript")
-async def update_transcript(request: TranscriptUpdateRequest):
-    """
-    Update the transcript with new text.
-    """
-    # Add to conversation history
-    conversation_history.append({"role": "user", "content": request.transcript})
-    
-    # Generate a response (optional)
-    response = get_answer_from_text(request.transcript)
-    conversation_history.append({"role": "assistant", "content": response})
-    
+# Health check endpoint
+@app.get("/")
+async def health_check():
     return {
-        "status": "success",
-        "response": response
+        "status": "ok",
+        "message": "PEARL AI Backend is running",
+        "components": {
+            "core_agent": core_agent is not None,
+            "speech_processor": speech_processor is not None,
+            "camera_system": camera_system is not None,
+            "emotion_analyzer": emotion_analyzer is not None,
+            "rag_system": rag_system is not None,
+            "learning_tracker": learning_tracker is not None,
+            "intent_classifier": intent_classifier is not None,
+            "command_executor": command_executor is not None
+        }
     }
 
+# Greeting endpoint - starts the interaction flow
 @app.get("/greeting")
 async def get_greeting():
-    """
-    Get a greeting to start the conversation.
-    """
-    greeting = "Hello! I'm your AI tutor. How can I help you today?"
+    """Get initial greeting message and start the learning session"""
+    if not core_agent:
+        return {"error": "Core agent not initialized"}
     
-    # Generate TTS for the greeting
-    audio_file = generate_tts_audio(greeting)
-    
-    return {
-        "greeting": greeting,
-        "audio": f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
-    }
-
-from backend.query_model import get_answer_from_image_and_prompt
-
-@app.post("/process_whiteboard_image")
-async def process_whiteboard_image(
-    request: Request
-):
-    """
-    Process the whiteboard image sent directly in the request body along with a prompt in the header.
-    """
     try:
-        # Get the prompt from the header
-        prompt = request.headers.get('x-prompt', '')
-        if not prompt:
-            return {"error": "Missing X-Prompt header"}
+        # Get personalized greeting based on learning history
+        greeting_response = await core_agent.get_personalized_greeting()
+        return greeting_response
+    except Exception as e:
+        print(f"Error getting greeting: {e}")
+        return {"error": str(e)}
+
+# Main speech processing endpoint
+@app.post("/tutor/speak")
+async def process_speech(file: UploadFile = File(...)):
+    """Process speech input through the complete AI pipeline"""
+    if not core_agent:
+        return {"error": "Core agent not initialized"}
+    
+    try:
+        print(f"Processing speech file: {file.filename}")
         
-        # Read the image data from the request body
+        # Read audio data
+        audio_data = await file.read()
+        
+        # Process through core agent
+        response = await core_agent.process_speech_input(audio_data)
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error processing speech: {e}")
+        return {"error": str(e)}
+
+# Text input endpoint
+@app.post("/tutor/text")
+async def process_text(request: TextRequest):
+    """Process text input through the complete AI pipeline"""
+    if not core_agent:
+        return {"error": "Core agent not initialized"}
+    
+    try:
+        print(f"Processing text: {request.text}")
+        
+        # Process through core agent
+        response = await core_agent.process_text_input(request.text)
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error processing text: {e}")
+        return {"error": str(e)}
+
+# Whiteboard image processing
+@app.post("/process_whiteboard_image")
+async def process_whiteboard_image(request: Request):
+    """Process whiteboard image with prompt"""
+    if not core_agent:
+        return {"error": "Core agent not initialized"}
+    
+    try:
+        # Get prompt from header
+        prompt = request.headers.get("X-Prompt", "What's in this image?")
+        
+        # Read image data
         image_data = await request.body()
         
-        # Get a response based on the image and prompt
-        response = get_answer_from_image_and_prompt(image_data, prompt)
+        # Process through core agent
+        response = await core_agent.process_whiteboard_image(image_data, prompt)
         
-        # Generate TTS for the response
-        audio_file = generate_tts_audio(response)
-        audio_path = f"/tts_output/{audio_file}?t={os.path.getmtime(os.path.join(TTS_OUTPUT_DIR, audio_file))}"
+        return response
         
+    except Exception as e:
+        print(f"Error processing whiteboard image: {e}")
+        return {"error": str(e)}
+
+# Text-to-speech endpoint
+@app.post("/tts")
+async def text_to_speech(request: TTSRequest):
+    """Generate speech from text"""
+    if not speech_processor:
+        return {"error": "Speech processor not initialized"}
+    
+    try:
+        audio_file = speech_processor.generate_speech(request.text)
         return {
-            "response": response,
-            "audio": audio_path
+            "message": "Speech generated successfully",
+            "audio": f"/tts_output/{audio_file}"
         }
     except Exception as e:
         return {"error": str(e)}
 
-# =============== New RAG System Endpoints ===============
-
-@app.get("/rag/documents", response_model=List[DocumentInfo])
-async def get_documents():
-    """
-    Get the list of all documents in the RAG system.
-    """
-    try:
-        rag_system = get_rag_system()
-        return rag_system.get_document_list()
-    except Exception as e:
-        print(f"Error getting document list: {e}")
-        return {"error": str(e)}
-
-@app.post("/rag/scan", response_model=ScanResponse)
-async def scan_documents():
-    """
-    Scan the RAG_docs folder for new or updated documents.
-    """
-    try:
-        rag_system = get_rag_system()
-        result = rag_system.scan_rag_docs_folder()
-        return result
-    except Exception as e:
-        print(f"Error scanning RAG_docs folder: {e}")
-        return {"error": str(e)}
-
-@app.post("/rag/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload a document to the RAG_docs folder.
-    """
-    try:
-        # Save the file to the RAG_docs directory
-        file_path = os.path.join(RAG_DOCS_DIR, file.filename)
-        
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Scan the folder to process the new file
-        rag_system = get_rag_system()
-        result = rag_system.scan_rag_docs_folder()
-        
-        return {
-            "message": f"File uploaded successfully: {file.filename}",
-            "scan_result": result
-        }
-    except Exception as e:
-        print(f"Error uploading document: {e}")
-        return {"error": str(e)}
-
-@app.post("/rag/remove")
-async def remove_document(request: RemoveDocumentRequest):
-    """
-    Remove a document from the RAG system (but not from the folder).
-    """
-    try:
-        rag_system = get_rag_system()
-        success = rag_system.remove_document(request.doc_id)
-        
-        if success:
-            return {"message": f"Document removed successfully: {request.doc_id}"}
-        else:
-            return {"error": f"Failed to remove document: {request.doc_id}"}
-    except Exception as e:
-        print(f"Error removing document: {e}")
-        return {"error": str(e)}
-
-# Cleanup endpoint to manually clean temporary files if needed
-@app.post("/cleanup")
-async def cleanup_temp_files():
-    """
-    Clean up temporary files.
-    """
-    files_cleaned = []
+# Camera control endpoints
+@app.post("/camera/start")
+async def start_camera():
+    """Start the camera system"""
+    if not camera_system:
+        return {"error": "Camera system not available"}
     
-    # Clean up temp audio file
-    if os.path.exists(TEMP_AUDIO_PATH):
-        try:
-            os.remove(TEMP_AUDIO_PATH)
-            files_cleaned.append(TEMP_AUDIO_PATH)
-        except Exception as e:
-            pass
-    
+    success = camera_system.start()
     return {
-        "message": "Cleanup completed",
-        "files_cleaned": files_cleaned
+        "success": success,
+        "message": "Camera started" if success else "Failed to start camera"
     }
 
-if __name__ == "__main__":
-    import uvicorn
+@app.post("/camera/stop")
+async def stop_camera():
+    """Stop the camera system"""
+    if not camera_system:
+        return {"error": "Camera system not available"}
     
-    # Ensure clean state on startup
-    for path in [TEMP_AUDIO_PATH]:
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception as e:
-                print(f"Warning: Could not remove temp file at startup: {e}")
+    success = camera_system.stop()
+    return {
+        "success": success,
+        "message": "Camera stopped" if success else "Failed to stop camera"
+    }
+
+@app.post("/camera/capture")
+async def capture_image():
+    """Capture image from camera"""
+    if not camera_system:
+        return {"error": "Camera system not available"}
     
-    # Configure OpenRouter API key
-    os.environ["OPENROUTER_API_KEY"] = "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"
-    print("OpenRouter API key configured")
-    
-    # Scan RAG_docs folder on startup
     try:
-        rag_system = get_rag_system()
-        result = rag_system.scan_rag_docs_folder()
-        print("RAG_docs scan result:", result)
+        result = camera_system.capture_image()
+        return result if result else {"error": "Failed to capture image"}
     except Exception as e:
-        print(f"Error scanning RAG_docs on startup: {e}")
+        return {"error": str(e)}
+
+# Learning progress endpoints
+@app.get("/learning/progress")
+async def get_learning_progress():
+    """Get current learning progress"""
+    if not learning_tracker:
+        return {"error": "Learning tracker not available"}
     
+    try:
+        progress = learning_tracker.get_current_progress()
+        return progress
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/learning/log_answer")
+async def log_answer_result(request: dict):
+    """Log student answer result"""
+    if not learning_tracker:
+        return {"error": "Learning tracker not available"}
+    
+    try:
+        topic = request.get("topic", "math")
+        is_correct = request.get("is_correct", False)
+        difficulty = request.get("difficulty", "medium")
+        
+        learning_tracker.log_answer_result(topic, is_correct, difficulty)
+        
+        return {"message": "Answer result logged successfully"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/learning/objectives")
+async def get_learning_objectives():
+    """Get current learning objectives"""
+    if not learning_tracker:
+        return {"error": "Learning tracker not available"}
+    
+    try:
+        objectives = learning_tracker.get_active_objectives()
+        return objectives
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/learning/reset")
+async def reset_learning_progress():
+    """Reset learning progress"""
+    if not learning_tracker:
+        return {"error": "Learning tracker not available"}
+    
+    try:
+        learning_tracker.reset_progress()
+        return {"message": "Learning progress reset"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# RAG system endpoints
+@app.get("/rag/documents")
+async def get_documents():
+    """Get list of documents in RAG system"""
+    if not rag_system:
+        return {"error": "RAG system not available"}
+    
+    try:
+        return rag_system.get_document_list()
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/rag/scan")
+async def scan_documents():
+    """Scan and update RAG documents"""
+    if not rag_system:
+        return {"error": "RAG system not available"}
+    
+    try:
+        result = rag_system.scan_documents_folder()
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+# WebSocket for real-time communication
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time communication"""
+    await websocket.accept()
+    
+    try:
+        while True:
+            # Receive message
+            data = await websocket.receive_json()
+            
+            if not core_agent:
+                await websocket.send_json({
+                    "type": "error",
+                    "data": {"message": "Core agent not initialized"}
+                })
+                continue
+            
+            # Process message through core agent
+            response = await core_agent.process_websocket_message(data)
+            
+            # Send response
+            await websocket.send_json(response)
+            
+    except WebSocketDisconnect:
+        print("WebSocket client disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "data": {"message": str(e)}
+            })
+        except:
+            pass
+
+if __name__ == "__main__":
+    print("Starting PEARL AI Backend...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
